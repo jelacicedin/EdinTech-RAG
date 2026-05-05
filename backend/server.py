@@ -28,7 +28,7 @@ from typing import Any
 import httpx
 import ollama
 import uvicorn
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -55,7 +55,8 @@ llama_server_url = os.environ.get(
     "http://localhost:8080",
 )
 
-os.environ["OLLAMA_BASE_URL"] = ollama_url.rstrip("/")
+# The Python 'ollama' library reads OLLAMA_HOST (not OLLAMA_BASE_URL)
+os.environ["OLLAMA_HOST"] = ollama_url.rstrip("/")
 
 logger = logging.getLogger("edintech-rag")
 
@@ -169,6 +170,16 @@ async def _verify_startup() -> None:
             f"Cannot connect to PostgreSQL at {env_db_url}: {exc}"
         ) from exc
 
+    # --- Embedding backend (always Ollama) ---
+    try:
+        resp_data = ollama.list()
+        models = resp_data.get("models", []) or []
+        model_names = [m.get("name", "") or m.get("model", "") for m in models]
+        logger.info("Ollama reachable — %d model(s) available: %s",
+                    len(model_names), model_names)
+    except Exception as exc:
+        logger.error("Ollama not reachable at %s — %s", ollama_url, exc)
+
     # --- Generation backend ---
     if gen_backend == "llama_cpp":
         try:
@@ -181,15 +192,6 @@ async def _verify_startup() -> None:
         except Exception as exc:
             logger.error(
                 "llama.cpp server not reachable at %s — %s", llama_server_url, exc
-            )
-    else:
-        try:
-            models = ollama.list()
-            model_names = [m.get("name", "") for m in models.get("models", [])]
-            logger.info("Ollama models available: %s", model_names)
-        except Exception as exc:
-            logger.error(
-                "Ollama not reachable at %s — %s", ollama_url, exc
             )
 
 
@@ -439,22 +441,29 @@ async def health():
     embed_available = False
     gen_ok = False
 
+    # Embeddings always use Ollama — check it regardless of generation backend
+    try:
+        resp_data = ollama.list()
+        models = resp_data.get("models", [])
+        if models is None:
+            models = []
+        model_names = [m.get("name", "") or m.get("model", "") for m in models]
+        ollama_ok = True
+
+        # Match by model name prefix (e.g. "qwen3-embedding:0.6b" matches "qwen3-embedding")
+        embed_prefix = embed_model.split(":")[0]
+        gen_prefix = gen_model.split(":")[0]
+        embed_available = any(n.startswith(embed_prefix + ":") or n == embed_prefix for n in model_names)
+        gen_ok = any(n.startswith(gen_prefix + ":") or n == gen_prefix for n in model_names)
+    except Exception:
+        pass
+
+    # If using llama_cpp backend, also verify the llama.cpp server is reachable
     if gen_backend == "llama_cpp":
-        # Check llama.cpp server
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(f"{llama_server_url}/health")
                 gen_ok = resp.status_code < 400
-        except Exception:
-            pass
-    else:
-        # Check Ollama + models
-        try:
-            models = ollama.list()
-            model_names = [m.get("name", "") for m in models.get("models", [])]
-            ollama_ok = True
-            embed_available = any(embed_model.split(":")[0] in n for n in model_names)
-            gen_ok = any(gen_model.split(":")[0] in n for n in model_names)
         except Exception:
             pass
 
@@ -664,8 +673,8 @@ async def list_chunks(doc_id: int, page: int = 1, per_page: int = 20):
 
 @app.post("/ingest")
 async def ingest_document(
-    file: Any,
-    category: str = "other",
+    file: UploadFile = File(...),
+    category: str = Form(default="other"),
     equipment_id: str | None = Form(default=None),
     location: str | None = Form(default=None),
     revision: str | None = Form(default=None),
@@ -676,74 +685,91 @@ async def ingest_document(
     converts it to markdown, inserts into the documents table, chunks + embeds
     via chunker.py, then cleans up the temp file.
     """
+    logger.info(
+        "Ingest request: filename=%s category=%s equipment_id=%s location=%s revision=%s",
+        file.filename,
+        category,
+        equipment_id,
+        location,
+        revision,
+    )
+
     from converter import convert_file  # noqa: E402
     from chunker import chunk_and_insert  # noqa: E402
 
-    # Save uploaded file to a temporary location
-    with tempfile.NamedTemporaryFile(
-        delete=False, suffix=Path(file.filename).suffix
-    ) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
-
     try:
-        path = Path(tmp_path)
-        file_type = path.suffix.lstrip(".").lower()
+        # Save uploaded file to a temporary location
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=Path(file.filename).suffix
+        ) as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
 
-        # Convert to markdown
         try:
-            markdown, metadata = convert_file(str(path))
-        except Exception as exc:
-            raise HTTPException(
-                status_code=400, detail=f"Conversion failed: {exc}"
-            ) from exc
+            path = Path(tmp_path)
+            file_type = path.suffix.lstrip(".").lower()
 
-        # Insert document record and chunk/embed
-        import psycopg  # noqa: E402
+            # Convert to markdown
+            try:
+                markdown, metadata = convert_file(str(path))
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"Conversion failed: {exc}"
+                ) from exc
 
-        db = psycopg.connect(env_db_url)
-        try:
-            cur = db.cursor()
-            eq_id = int(equipment_id) if equipment_id else None
-            cur.execute(
-                """
-                INSERT INTO documents (filename, file_type, document_category,
-                                       title, markdown_content, source_path, metadata,
-                                       equipment_id, location, revision)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (
-                    file.filename,
-                    file_type,
-                    category,
-                    metadata.get("title"),
-                    markdown,
-                    tmp_path,
-                    json.dumps(metadata, default=str),
-                    eq_id,
-                    location,
-                    revision,
-                ),
-            )
-            doc_id = cur.fetchone()[0]
+            # Insert document record and chunk/embed
+            import psycopg  # noqa: E402
 
-            chunks_count = chunk_and_insert(doc_id, markdown, file_type, db)
-            db.commit()
-        except Exception as exc:
-            db.rollback()
-            raise HTTPException(
-                status_code=500, detail=f"Ingestion failed: {exc}"
-            ) from exc
+            db = psycopg.connect(env_db_url)
+            try:
+                cur = db.cursor()
+                eq_id = int(equipment_id) if equipment_id else None
+                cur.execute(
+                    """
+                    INSERT INTO documents (filename, file_type, document_category,
+                                           title, markdown_content, source_path, metadata,
+                                           equipment_id, location, revision)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        file.filename,
+                        file_type,
+                        category,
+                        metadata.get("title"),
+                        markdown,
+                        tmp_path,
+                        json.dumps(metadata, default=str),
+                        eq_id,
+                        location,
+                        revision,
+                    ),
+                )
+                doc_id = cur.fetchone()[0]
+
+                chunks_count = chunk_and_insert(doc_id, markdown, file_type, db)
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                raise HTTPException(
+                    status_code=500, detail=f"Ingestion failed: {exc}"
+                ) from exc
+            finally:
+                db.close()
+
         finally:
-            db.close()
+            # Clean up temp file
+            Path(tmp_path).unlink(missing_ok=True)
 
-    finally:
-        # Clean up temp file
-        Path(tmp_path).unlink(missing_ok=True)
-
-    return {"document_id": doc_id, "filename": file.filename, "chunks": chunks_count}
+        return {"document_id": doc_id, "filename": file.filename, "chunks": chunks_count}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Ingest failed for %s: %s", file.filename, exc, exc_info=True
+        )
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/documents/upload")

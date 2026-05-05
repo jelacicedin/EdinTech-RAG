@@ -9,6 +9,7 @@ Run:
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -82,6 +83,96 @@ _init_session()
 
 
 # ---------------------------------------------------------------------------
+# Helper functions (defined before use)
+# ---------------------------------------------------------------------------
+
+
+def _extract_error_detail(text: str) -> str:
+    """Try to parse JSON error detail from FastAPI responses."""
+    try:
+        data = json.loads(text)
+        return data.get("detail", text[:200])
+    except Exception:
+        return text[:200]
+
+
+def _handle_ingestion(files: list) -> None:
+    """Upload files one-by-one to POST /ingest and show per-file status."""
+    for f in files:
+        with st.status(f"Uploading **{f.name}** …", expanded=False) as status:
+            try:
+                resp = httpx.post(
+                    f"{BACKEND_URL}/ingest",
+                    files={"file": (f.name, f.read(), f.type)},
+                    data={
+                        "category": upload_category,
+                        "equipment_id": upload_equipment_id or None,
+                        "location": upload_location or None,
+                        "revision": upload_revision or None,
+                    },
+                    timeout=300,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                chunks = result.get("chunks", 0)
+                status.update(
+                    label=f"Done — **{f.name}** ingested ({chunks} chunks)",
+                    state="complete",
+                )
+            except httpx.HTTPStatusError as exc:
+                detail = _extract_error_detail(exc.response.text)
+                status.update(
+                    label=f"Failed — **{f.name}** ({exc.response.status_code})",
+                    state="error",
+                )
+            except Exception as exc:
+                status.update(
+                    label=f"Error — **{f.name}**",
+                    state="error",
+                )
+
+
+def _delete_document(doc_id: int) -> None:
+    """Delete a document by ID and refresh."""
+    try:
+        resp = httpx.delete(f"{BACKEND_URL}/documents/{doc_id}", timeout=10)
+        if resp.status_code == 204:
+            st.toast(f"Document {doc_id} deleted", icon="🗑️")
+        else:
+            st.toast(f"Failed to delete document {doc_id}", icon="❌")
+    except Exception as exc:
+        st.toast(f"Error deleting document: {exc}", icon="❌")
+    st.rerun()
+
+
+def _render_documents_table() -> None:
+    """Fetch and display all documents with delete buttons."""
+    try:
+        resp = httpx.get(f"{BACKEND_URL}/documents", timeout=10)
+        resp.raise_for_status()
+        docs = resp.json()
+    except Exception as exc:
+        st.caption(f"Could not fetch documents: {exc}")
+        return
+
+    if not docs:
+        st.caption("No documents ingested yet.")
+        return
+
+    # Render delete buttons per row alongside a simple list
+    for d in docs:
+        col1, col2 = st.columns([6, 1])
+        with col1:
+            st.caption(
+                f"{d['filename']} "
+                f"({d['document_category']}) — {d['chunk_count']} chunks"
+            )
+        with col2:
+            if st.button("Delete", key=f"del_{d['id']}", use_container_width=True):
+                _delete_document(d["id"])
+
+
+# ---------------------------------------------------------------------------
 # Sidebar — file upload & document management
 # ---------------------------------------------------------------------------
 
@@ -123,103 +214,6 @@ with st.sidebar:
     if st.button("Clear Chat", use_container_width=True):
         st.session_state.messages = []  # type: ignore[assignment]
         st.rerun()
-
-
-# ---------------------------------------------------------------------------
-# Ingestion handler
-# ---------------------------------------------------------------------------
-
-
-def _handle_ingestion(files: list) -> None:
-    """Upload files one-by-one to POST /ingest and show per-file status."""
-    for f in files:
-        with st.status(f"Uploading **{f.name}** …", expanded=False) as status:
-            try:
-                resp = httpx.post(
-                    f"{BACKEND_URL}/ingest",
-                    files={"file": (f.name, f.read(), f.type)},
-                    data={
-                        "category": upload_category,
-                        "equipment_id": upload_equipment_id or None,
-                        "location": upload_location or None,
-                        "revision": upload_revision or None,
-                    },
-                    timeout=300,
-                )
-                resp.raise_for_status()
-                result = resp.json()
-                chunks = result.get("chunks", 0)
-                status.update(
-                    label=f"Done — **{f.name}** ingested ({chunks} chunks)",
-                    state="complete",
-                )
-            except httpx.HTTPStatusError as exc:
-                detail = _extract_error_detail(exc.response.text)
-                status.update(
-                    label=f"Failed — **{f.name}** ({exc.response.status_code})",
-                    state="error",
-                )
-            except Exception as exc:
-                status.update(
-                    label=f"Error — **{f.name}**",
-                    state="error",
-                )
-
-
-def _extract_error_detail(text: str) -> str:
-    """Try to parse JSON error detail from FastAPI responses."""
-    try:
-        import json  # noqa: E402
-
-        data = json.loads(text)
-        return data.get("detail", text[:200])
-    except Exception:
-        return text[:200]
-
-
-# ---------------------------------------------------------------------------
-# Documents table
-# ---------------------------------------------------------------------------
-
-
-def _render_documents_table() -> None:
-    """Fetch and display all documents with delete buttons."""
-    try:
-        resp = httpx.get(f"{BACKEND_URL}/documents", timeout=10)
-        resp.raise_for_status()
-        docs = resp.json()
-    except Exception as exc:
-        st.caption(f"Could not fetch documents: {exc}")
-        return
-
-    if not docs:
-        st.caption("No documents ingested yet.")
-        return
-
-    # Render delete buttons per row alongside a simple list
-    for d in docs:
-        col1, col2 = st.columns([6, 1])
-        with col1:
-            st.caption(
-                f"{d['filename']} "
-                f"({d['document_category']}) — {d['chunk_count']} chunks"
-            )
-        with col2:
-            if st.button("Delete", key=f"del_{d['id']}", use_container_width=True):
-                _delete_document(d["id"])
-
-
-def _delete_document(doc_id: int) -> None:
-    """Delete a document by ID and refresh."""
-    try:
-        resp = httpx.delete(f"{BACKEND_URL}/documents/{doc_id}", timeout=10)
-        if resp.status_code == 204:
-            st.toast(f"Document {doc_id} deleted", icon="🗑️")
-        else:
-            st.toast(f"Failed to delete document {doc_id}", icon="❌")
-    except Exception as exc:
-        st.toast(f"Error deleting document: {exc}", icon="❌")
-    st.rerun()
 
 
 # ---------------------------------------------------------------------------
