@@ -16,6 +16,7 @@ Run in production (Docker):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -107,12 +108,12 @@ class QueryRequest(BaseModel):
 
 
 class Source(BaseModel):
-    filename: str
-    document_category: str
-    equipment_id: int | None
+    doc_filename: str
+    doc_category: str
+    doc_equipment_id: int | None
     section: str
     chunk_index: int
-    score: float
+    rrf_score: float
 
 
 class QueryResponse(BaseModel):
@@ -233,13 +234,13 @@ async def _hybrid_search(
     #               rrf_k=60, filter_equipment_id, filter_document_category,
     #               filter_file_type, filter_location)
     sql = """
-        SELECT id, document_id, content, metadata,
-               filename, document_category, equipment_id, location, score
+        SELECT chunk_id, chunk_document_id, chunk_content, chunk_metadata,
+               doc_filename, doc_category, doc_equipment_id, doc_location, rrf_score
         FROM hybrid_search(
             $1, $2, $3, 60,   -- query_text, embedding, top_k, rrf_k
             $4, $5, $6, $7    -- filter_equipment_id, category, file_type, location
         )
-        ORDER BY score DESC
+        ORDER BY rrf_score DESC
         LIMIT $8
     """
 
@@ -260,22 +261,22 @@ async def _hybrid_search(
 
     results = []
     for row in rows:
-        meta = row["metadata"] or {}
+        meta = row["chunk_metadata"] or {}
         section = meta.get("section_heading", "Unknown") if isinstance(meta, dict) else "Unknown"
         chunk_index = (
             meta.get("chunk_index", 0) if isinstance(meta, dict) else 0
         )
         results.append(
             {
-                "id": int(row["id"]),
-                "document_id": int(row["document_id"]),
-                "content": row["content"],
-                "filename": row["filename"],
-                "document_category": str(row["document_category"]),
-                "equipment_id": int(row["equipment_id"]) if row["equipment_id"] else None,
+                "chunk_id": int(row["chunk_id"]),
+                "chunk_document_id": int(row["chunk_document_id"]),
+                "chunk_content": row["chunk_content"],
+                "doc_filename": row["doc_filename"],
+                "doc_category": str(row["doc_category"]),
+                "doc_equipment_id": int(row["doc_equipment_id"]) if row["doc_equipment_id"] else None,
                 "section": section,
                 "chunk_index": chunk_index,
-                "score": float(row["score"]),
+                "rrf_score": float(row["rrf_score"]),
             }
         )
     return results
@@ -311,9 +312,9 @@ def _build_user_prompt(question: str, sources: list[dict[str, Any]]) -> str:
     context_parts = []
     for i, src in enumerate(sources):
         context_parts.append(
-            f"[Source {i+1}] File: {src['filename']}, "
-            f"Section: {src['section']}, Score: {src['score']:.4f}\n"
-            f"{src['content']}"
+            f"[Source {i+1}] File: {src['doc_filename']}, "
+            f"Section: {src['section']}, Score: {src['rrf_score']:.4f}\n"
+            f"{src['chunk_content']}"
         )
     context = "\n\n---\n\n".join(context_parts)
 
@@ -777,7 +778,13 @@ async def ingest_document(
                 _ingest_progress[job_id]["message"] = f"Chunking and embedding **{file.filename}** …"
                 logger.info("[ingest] Chunking & embedding %s", file.filename)
 
-                chunks_count = chunk_and_insert(doc_id, markdown, file_type, db)
+                def _progress(msg: str) -> None:
+                    _ingest_progress[job_id]["message"] = msg
+
+                chunks_count = chunk_and_insert(
+                    doc_id, markdown, file_type, db,
+                    progress_callback=_progress,
+                )
                 db.commit()
             except Exception as exc:
                 db.rollback()
@@ -816,8 +823,8 @@ def get_ingest_status(job_id: str):
 async def upload_document(file_path: str, category: str = "other"):
     """Upload and ingest a document by local path.
 
-    Converts the file to markdown, chunks it, embeds each chunk, and inserts
-    into the database. Uses converter.py + chunker.py logic internally.
+    Runs the blocking I/O (file conversion, embedding, DB insert) in a
+    thread pool so the async event loop stays responsive for other requests.
     """
     from pathlib import Path
 
@@ -825,56 +832,61 @@ async def upload_document(file_path: str, category: str = "other"):
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
 
-    # Import converters
-    try:
+    # Run blocking work off the event loop thread
+    def _do_upload() -> dict:
         from converter import convert_file  # noqa: E402
         from chunker import chunk_and_insert  # noqa: E402
-    except ImportError as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Missing converter modules: {exc}"
-        ) from exc
+        import psycopg  # noqa: E402
+
+        try:
+            markdown, metadata = convert_file(str(path))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Conversion failed: {exc}"
+            ) from exc
+
+        db = psycopg.connect(env_db_url)
+        try:
+            cur = db.cursor()
+            cur.execute(
+                """
+                INSERT INTO documents (filename, file_type, document_category,
+                                       title, markdown_content, source_path, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    path.name,
+                    path.suffix.lstrip(".").lower(),
+                    category,
+                    metadata.get("title"),
+                    markdown,
+                    str(path),
+                    json.dumps(metadata, default=str),
+                ),
+            )
+            doc_id = cur.fetchone()[0]
+
+            chunks_count = chunk_and_insert(
+                doc_id, markdown, path.suffix.lstrip(".").lower(), db
+            )
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Ingestion failed: {exc}") from exc
+        finally:
+            db.close()
+
+        return {"document_id": doc_id, "chunks": chunks_count}
 
     try:
-        markdown, metadata = convert_file(str(path))
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Conversion failed: {exc}"
-        ) from exc
-
-    # Use psycopg for document insertion (chunker uses sync DB)
-    import psycopg  # noqa: E402
-
-    db = psycopg.connect(env_db_url)
-    try:
-        cur = db.cursor()
-        cur.execute(
-            """
-            INSERT INTO documents (filename, file_type, document_category,
-                                   title, markdown_content, source_path, metadata)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-            """,
-            (
-                path.name,
-                path.suffix.lstrip(".").lower(),
-                category,
-                metadata.get("title"),
-                markdown,
-                str(path),
-                json.dumps(metadata, default=str),
-            ),
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _do_upload,
         )
-        doc_id = cur.fetchone()[0]
+    except HTTPException as he:
+        raise he
 
-        chunks_count = chunk_and_insert(doc_id, markdown, path.suffix.lstrip(".").lower(), db)
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {exc}") from exc
-    finally:
-        db.close()
-
-    return {"document_id": doc_id, "chunks": chunks_count}
+    return result
 
 
 # ---------------------------------------------------------------------------
