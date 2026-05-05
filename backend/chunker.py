@@ -196,8 +196,8 @@ def _chunk_table(lines: list[str], start: int, end: int,
 def _embed_text(text: str) -> list[float]:
     """Embed text using Ollama qwen3-embedding:0.6b."""
     import ollama
-    resp = ollama.embeddings(model="qwen3-embedding:0.6b", text=text)
-    return resp["embedding"]
+    resp = ollama.embed(model="qwen3-embedding:0.6b", input=text)
+    return resp["embeddings"][0]
 
 
 class ChunkingError(Exception):

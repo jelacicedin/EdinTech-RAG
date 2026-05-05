@@ -97,37 +97,76 @@ def _extract_error_detail(text: str) -> str:
 
 
 def _handle_ingestion(files: list) -> None:
-    """Upload files one-by-one to POST /ingest and show per-file status."""
+    """Upload files one-by-one to POST /ingest and poll for progress."""
+    import time
+
     for f in files:
-        with st.status(f"Uploading **{f.name}** …", expanded=False) as status:
+        with st.status(f"Uploading **{f.name}** …", expanded=True) as status:
             try:
+                resp_data = f.read()
+
+                # Start ingestion job
                 resp = httpx.post(
                     f"{BACKEND_URL}/ingest",
-                    files={"file": (f.name, f.read(), f.type)},
+                    files={"file": (f.name, resp_data, f.type)},
                     data={
                         "category": upload_category,
                         "equipment_id": upload_equipment_id or None,
                         "location": upload_location or None,
                         "revision": upload_revision or None,
                     },
-                    timeout=300,
+                    timeout=30,
                 )
                 resp.raise_for_status()
-                result = resp.json()
-                chunks = result.get("chunks", 0)
-                status.update(
-                    label=f"Done — **{f.name}** ingested ({chunks} chunks)",
-                    state="complete",
-                )
+                job_id = resp.json()["job_id"]
+
+                # Poll for progress
+                last_message = None
+                for _ in range(600):  # max 5 minutes (500ms * 600)
+                    time.sleep(0.5)
+                    try:
+                        status_resp = httpx.get(
+                            f"{BACKEND_URL}/ingest/status/{job_id}",
+                            timeout=10,
+                        )
+                        if status_resp.status_code == 404:
+                            break
+                        job = status_resp.json()
+                        last_message = job.get("message", "")
+                        current_status = job.get("status", "unknown")
+
+                        if current_status == "complete":
+                            result = job.get("result", {})
+                            chunks = result.get("chunks", 0)
+                            status.update(
+                                label=job["message"],
+                                state="complete",
+                            )
+                            break
+                        elif current_status == "error":
+                            status.update(
+                                label=job["message"],
+                                state="error",
+                            )
+                            break
+                        else:
+                            status.update(label=last_message)
+                    except Exception:
+                        pass
+
+                # If still pending after timeout, show last known state
+                if last_message and "complete" not in str(status):
+                    status.update(label=last_message, state="complete")
+
             except httpx.HTTPStatusError as exc:
                 detail = _extract_error_detail(exc.response.text)
                 status.update(
-                    label=f"Failed — **{f.name}** ({exc.response.status_code})",
+                    label=f"Failed — **{f.name}** ({exc.response.status_code}): {detail}",
                     state="error",
                 )
             except Exception as exc:
                 status.update(
-                    label=f"Error — **{f.name}**",
+                    label=f"Error — **{f.name}**: {exc}",
                     state="error",
                 )
 

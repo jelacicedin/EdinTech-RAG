@@ -29,6 +29,7 @@ import httpx
 import ollama
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from starlette.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -59,6 +60,9 @@ llama_server_url = os.environ.get(
 os.environ["OLLAMA_HOST"] = ollama_url.rstrip("/")
 
 logger = logging.getLogger("edintech-rag")
+
+# In-memory progress store for ingest polling
+_ingest_progress: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -282,8 +286,8 @@ async def _hybrid_search(
 
 async def _embed_text(text: str) -> list[float]:
     """Embed text using Ollama embedding model."""
-    resp = ollama.embeddings(model=embed_model, text=text)
-    return resp["embedding"]
+    resp = ollama.embed(model=embed_model, input=text)
+    return resp["embeddings"][0]
 
 
 # ---------------------------------------------------------------------------
@@ -681,44 +685,63 @@ async def ingest_document(
 ):
     """Upload and ingest a document via multipart form data.
 
-    Accepts a file plus optional metadata fields. Saves the file temporarily,
-    converts it to markdown, inserts into the documents table, chunks + embeds
-    via chunker.py, then cleans up the temp file.
+    Accepts a file plus optional metadata fields. Returns a job ID that
+    can be polled for progress via GET /ingest/status/{job_id}.
     """
-    logger.info(
-        "Ingest request: filename=%s category=%s equipment_id=%s location=%s revision=%s",
-        file.filename,
-        category,
-        equipment_id,
-        location,
-        revision,
-    )
+    import io
+    import threading
+    import uuid
 
-    from converter import convert_file  # noqa: E402
-    from chunker import chunk_and_insert  # noqa: E402
+    # Read file content synchronously before spawning thread (file may not be seekable)
+    content = await file.read()
 
-    try:
-        # Save uploaded file to a temporary location
-        with tempfile.NamedTemporaryFile(
-            delete=False, suffix=Path(file.filename).suffix
-        ) as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
+    job_id = str(uuid.uuid4())
+    _ingest_progress[job_id] = {
+        "status": "queued",
+        "message": f"Queued **{file.filename}**",
+        "filename": file.filename,
+        "stage": None,
+        "result": None,
+    }
+
+    def _run_ingest():
+        from converter import convert_file  # noqa: E402
+        from chunker import chunk_and_insert  # noqa: E402
+
+        tmp_path = None
+        doc_id = None
+        chunks_count = 0
 
         try:
+            _ingest_progress[job_id]["status"] = "processing"
+            _ingest_progress[job_id]["message"] = f"Saving **{file.filename}** …"
+            logger.info("[ingest] Saving %s", file.filename)
+
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=Path(file.filename).suffix
+            ) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+
+            _ingest_progress[job_id]["stage"] = "converting"
+            _ingest_progress[job_id]["message"] = f"Converting **{file.filename}** to markdown …"
+            logger.info("[ingest] Converting %s", file.filename)
+
             path = Path(tmp_path)
             file_type = path.suffix.lstrip(".").lower()
 
-            # Convert to markdown
             try:
                 markdown, metadata = convert_file(str(path))
             except Exception as exc:
-                raise HTTPException(
-                    status_code=400, detail=f"Conversion failed: {exc}"
-                ) from exc
+                logger.error("[ingest] Conversion failed for %s: %s", file.filename, exc)
+                _ingest_progress[job_id]["status"] = "error"
+                _ingest_progress[job_id]["message"] = f"Conversion failed: {exc}"
+                return
 
-            # Insert document record and chunk/embed
+            _ingest_progress[job_id]["stage"] = "inserting"
+            _ingest_progress[job_id]["message"] = f"Inserting **{file.filename}** into database …"
+            logger.info("[ingest] Inserting %s into database", file.filename)
+
             import psycopg  # noqa: E402
 
             db = psycopg.connect(env_db_url)
@@ -748,28 +771,43 @@ async def ingest_document(
                 )
                 doc_id = cur.fetchone()[0]
 
+                _ingest_progress[job_id]["stage"] = "chunking"
+                _ingest_progress[job_id]["message"] = f"Chunking and embedding **{file.filename}** …"
+                logger.info("[ingest] Chunking & embedding %s", file.filename)
+
                 chunks_count = chunk_and_insert(doc_id, markdown, file_type, db)
                 db.commit()
             except Exception as exc:
                 db.rollback()
-                raise HTTPException(
-                    status_code=500, detail=f"Ingestion failed: {exc}"
-                ) from exc
+                logger.error("[ingest] DB error for %s: %s", file.filename, exc)
+                _ingest_progress[job_id]["status"] = "error"
+                _ingest_progress[job_id]["message"] = f"Database error: {exc}"
+                return
             finally:
                 db.close()
 
         finally:
-            # Clean up temp file
-            Path(tmp_path).unlink(missing_ok=True)
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
 
-        return {"document_id": doc_id, "filename": file.filename, "chunks": chunks_count}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error(
-            "Ingest failed for %s: %s", file.filename, exc, exc_info=True
-        )
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        _ingest_progress[job_id]["status"] = "complete"
+        _ingest_progress[job_id]["message"] = f"Done — **{file.filename}** ingested ({chunks_count} chunks)"
+        _ingest_progress[job_id]["result"] = {
+            "document_id": doc_id,
+            "filename": file.filename,
+            "chunks": chunks_count,
+        }
+
+    threading.Thread(target=_run_ingest, daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/ingest/status/{job_id}")
+def get_ingest_status(job_id: str):
+    """Poll the current status of an ingest job."""
+    if job_id not in _ingest_progress:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _ingest_progress[job_id]
 
 
 @app.post("/documents/upload")
