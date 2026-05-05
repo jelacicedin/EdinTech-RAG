@@ -1,56 +1,117 @@
+version: "3.9"
+
 services:
-  backend:
+  # -----------------------------------------------------------------------
+  # PostgreSQL + pgvector
+  # -----------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: edintech-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-edintech}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB:   ${POSTGRES_DB:-edintechrag}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./supabase/20260505_init.sql:/docker-entrypoint-initdb.d/001_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-edintech}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # -----------------------------------------------------------------------
+  # Ollama — serves embedding model (generation is separate)
+  # -----------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: edintech-ollama
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      OLLAMA_HOST: 0.0.0.0
+      OLLAMA_KEEP_ALIVE: "24h"
+
+  # -----------------------------------------------------------------------
+  # llama.cpp server — alternative generation backend
+  # Uncomment below and set GEN_BACKEND=llama_cpp in .env to use it.
+  # Requires MODEL_PATH and MODEL_FILE env vars pointing to a GGUF model.
+  # -----------------------------------------------------------------------
+  # llama-server:
+  #   container_name: edintech-llama
+  #   restart: unless-stopped
+  #   ports:
+  #     - "${LLAMA_PORT:-8080}:8080"
+  #   volumes:
+  #     - ${MODEL_PATH:-/data/models}:/models:ro
+  #   command: >
+  #     /bin/bash -c "
+  #       apt-get update && apt-get install -y wget ca-certificates &&
+  #       wget -q https://github.com/ggerganov/llama.cpp/releases/download/b3845/llama-server-linux-x64.tar.gz &&
+  #       tar xzf llama-server-linux-x64.tar.gz &&
+  #       ./llama-server --model /models/${MODEL_FILE} --port 8080 --host 0.0.0.0
+  #         --n-gpu-layers 999 -c 32768 --temp 0.6 --top-k 20 --top-p 0.95
+  #         --presence-penalty 1.5
+  #     "
+  #   depends_on:
+  #     - ollama
+
+  # -----------------------------------------------------------------------
+  # EdinTech-RAG API server
+  # Generation backend controlled by GEN_BACKEND env var:
+  #   - "ollama"      (default, uses Ollama chat endpoint)
+  #   - "llama_cpp"   (uses llama.cpp /v1/chat/completions)
+  # -----------------------------------------------------------------------
+  app:
     build:
       context: ./backend
+      dockerfile: Dockerfile
+    container_name: edintech-app
+    restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "${APP_PORT:-8000}:8000"
     environment:
-      - HOME=/tmp
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_KEY=${SUPABASE_KEY}
-      - CHAT_MODEL_NAME=${CHAT_MODEL_NAME}
-      - CHAT_MODEL_PROVIDER=${CHAT_MODEL_PROVIDER}
-      - ENRICHMENT_MODEL_NAME=${ENRICHMENT_MODEL_NAME:-}
-      - ENRICHMENT_MODEL_PROVIDER=${ENRICHMENT_MODEL_PROVIDER:-}
-      - EMBEDDINGS_MODEL=${EMBEDDINGS_MODEL}
-      - EMBEDDINGS_PROVIDER=${EMBEDDINGS_PROVIDER}
-      - RERANKER_MODEL=${RERANKER_MODEL}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - DO_PICTURE_DESCRIPTION=${DO_PICTURE_DESCRIPTION:-false}
-      - OLLAMA_HOST=${OLLAMA_URL:-}
-      - OLLAMA_URL=${OLLAMA_URL:-}
-      - VLM_MODEL=${VLM_MODEL:-}
-      - OLLAMA_CONTEXT_WINDOW=${OLLAMA_CONTEXT_WINDOW:-}
-      - OLLAMA_REASONING=${OLLAMA_REASONING:-false}
-    read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urlib.request; urlib.request.urlopen('http://localhost:8000/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-  
-  frontend:
-    build:
-      context: ./frontend
-    ports:
-      - "8501:8501"
-    environment:
-      - HOME=/tmp
-      - API_URL=http://backend:8000
-    read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    security_opt:
-      -no-new-privileges:true
+      DATABASE_URL: postgresql://${POSTGRES_USER:-edintech}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-edintechrag}
+      OLLAMA_URL:  http://ollama:11434
+      EMBED_MODEL: ${EMBED_MODEL:-qwen3-embedding:0.6b}
+      GEN_BACKEND: ${GEN_BACKEND:-ollama}
+      GENERATION_MODEL: ${GENERATION_MODEL:-qwen3.6:27b}
+      OLLAMA_THINK: ${OLLAMA_THINK:-true}
+      LLAMA_SERVER_URL: ${LLAMA_SERVER_URL:-http://host.docker.internal:8080}
     depends_on:
-      backend:
+      postgres:
         condition: service_healthy
+      ollama:
+        condition: service_started
+
+  # -----------------------------------------------------------------------
+  # Ingestion worker — pulls files from /ingest and processes them
+  # -----------------------------------------------------------------------
+  ingest:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: edintech-ingest
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-edintech}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-edintechrag}
+      OLLAMA_URL:  http://ollama:11434
+      EMBED_MODEL: ${EMBED_MODEL:-qwen3-embedding:0.6b}
+    volumes:
+      - ./ingest:/workspace/ingest:ro
+    command: ["python", "ingest.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+
+volumes:
+  pgdata:
+  ollama_data:

@@ -1,0 +1,830 @@
+"""EdinTech-RAG — FastAPI server for industrial document Q&A.
+
+Provides a REST API that embeds user questions, performs hybrid search
+(semantic + keyword via RRF) against the ingested document database, and
+uses a local LLM to generate grounded answers with citations.
+
+Generation backend: Ollama (default) or llama.cpp llama-server.
+Embeddings always use Ollama.
+
+Run in development:
+    uvicorn server:app --reload
+
+Run in production (Docker):
+    docker-compose up app
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from contextlib import asynccontextmanager
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import httpx
+import ollama
+import uvicorn
+from fastapi import FastAPI, Form, HTTPException
+from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+env_db_url = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://edintech:password@localhost:5432/edintechrag",
+)
+ollama_url = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434")
+embed_model = os.environ.get("EMBED_MODEL", "qwen3-embedding:0.6b")
+
+# Generation backend: "ollama" or "llama_cpp"
+gen_backend = os.environ.get("GEN_BACKEND", "ollama").lower().strip()
+
+# Ollama generation config (used when GEN_BACKEND=ollama)
+gen_model = os.environ.get("GENERATION_MODEL", "qwen3.6:27b")
+ollama_think = os.environ.get("OLLAMA_THINK", "true").lower() in ("true", "1", "yes")
+
+# llama.cpp server config (used when GEN_BACKEND=llama_cpp)
+llama_server_url = os.environ.get(
+    "LLAMA_SERVER_URL",
+    "http://localhost:8080",
+)
+
+os.environ["OLLAMA_BASE_URL"] = ollama_url.rstrip("/")
+
+logger = logging.getLogger("edintech-rag")
+
+
+# ---------------------------------------------------------------------------
+# Database helper (asyncpg)
+# ---------------------------------------------------------------------------
+
+import asyncpg  # noqa: E402
+
+_pool: asyncpg.Pool | None = None
+
+
+async def _get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None or _pool.get_size() == 0:
+        _pool = await asyncpg.create_pool(dsn=env_db_url)
+    return _pool
+
+
+async def _close_pool() -> None:
+    global _pool
+    if _pool is not None:
+        await _pool.close()
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+
+class Filters(BaseModel):
+    equipment_id: int | None = None
+    document_category: str | None = None
+    file_type: str | None = None
+    location: str | None = None
+
+
+class QueryRequest(BaseModel):
+    question: str
+    filters: Filters = Field(default_factory=Filters)
+    top_k: int = 5
+    show_thinking: bool = False
+
+
+class Source(BaseModel):
+    filename: str
+    document_category: str
+    equipment_id: int | None
+    section: str
+    chunk_index: int
+    score: float
+
+
+class QueryResponse(BaseModel):
+    answer: str
+    thinking: str | None = None
+    sources: list[Source]
+
+
+class DocumentInfo(BaseModel):
+    id: int
+    filename: str
+    file_type: str
+    document_category: str
+    equipment_id: int | None
+    location: str | None
+    revision: str | None
+    document_date: str | None
+    ingested_at: str
+    chunk_count: int
+
+
+class HealthStatus(BaseModel):
+    postgres_ok: bool
+    ollama_ok: bool
+    embed_model_available: bool
+    generation_backend: str
+    generation_ok: bool
+    total_documents: int
+    total_chunks: int
+    message: str
+
+
+# ---------------------------------------------------------------------------
+# Startup / shutdown
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Validate all external dependencies on startup."""
+    await _verify_startup()
+    logger.info("EdinTech-RAG server started successfully (backend=%s).", gen_backend)
+    yield
+    await _close_pool()
+    logger.info("EdinTech-RAG server shutting down.")
+
+
+async def _verify_startup() -> None:
+    """Check PostgreSQL and generation backend connectivity."""
+    # --- PostgreSQL ---
+    try:
+        pool = await _get_pool()
+        async with pool.acquire() as conn:
+            version = await conn.fetchval("SELECT version()")
+            logger.info("PostgreSQL connected — %s", version.split("\n")[0])
+    except Exception as exc:
+        logger.error("PostgreSQL connection failed: %s", exc)
+        raise RuntimeError(
+            f"Cannot connect to PostgreSQL at {env_db_url}: {exc}"
+        ) from exc
+
+    # --- Generation backend ---
+    if gen_backend == "llama_cpp":
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{llama_server_url}/health")
+                logger.info(
+                    "llama.cpp server reachable at %s (status=%d)",
+                    llama_server_url, resp.status_code,
+                )
+        except Exception as exc:
+            logger.error(
+                "llama.cpp server not reachable at %s — %s", llama_server_url, exc
+            )
+    else:
+        try:
+            models = ollama.list()
+            model_names = [m.get("name", "") for m in models.get("models", [])]
+            logger.info("Ollama models available: %s", model_names)
+        except Exception as exc:
+            logger.error(
+                "Ollama not reachable at %s — %s", ollama_url, exc
+            )
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="EdinTech-RAG",
+    description="Industrial document Q&A via local RAG with hybrid search.",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid search
+# ---------------------------------------------------------------------------
+
+
+async def _hybrid_search(
+    query_text: str,
+    embedding: list[float],
+    top_k: int = 5,
+    filters: Filters | None = None,
+) -> list[dict[str, Any]]:
+    """Execute the hybrid_search PL/pgSQL function with RRF."""
+    pool = await _get_pool()
+
+    if filters is None:
+        filters = Filters()
+
+    # The PL/pgSQL function signature:
+    # hybrid_search(query_text, query_embedding, match_count,
+    #               rrf_k=60, filter_equipment_id, filter_document_category,
+    #               filter_file_type, filter_location)
+    sql = """
+        SELECT id, document_id, content, metadata,
+               filename, document_category, equipment_id, location, score
+        FROM hybrid_search(
+            $1, $2, $3, 60,   -- query_text, embedding, top_k, rrf_k
+            $4, $5, $6, $7    -- filter_equipment_id, category, file_type, location
+        )
+        ORDER BY score DESC
+        LIMIT $8
+    """
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            sql,
+            query_text,
+            embedding,
+            top_k,
+            filters.equipment_id,
+            filters.document_category,
+            filters.file_type,
+            filters.location,
+            top_k,
+        )
+
+    results = []
+    for row in rows:
+        meta = row["metadata"] or {}
+        section = meta.get("section_heading", "Unknown") if isinstance(meta, dict) else "Unknown"
+        chunk_index = (
+            meta.get("chunk_index", 0) if isinstance(meta, dict) else 0
+        )
+        results.append(
+            {
+                "id": int(row["id"]),
+                "document_id": int(row["document_id"]),
+                "content": row["content"],
+                "filename": row["filename"],
+                "document_category": str(row["document_category"]),
+                "equipment_id": int(row["equipment_id"]) if row["equipment_id"] else None,
+                "section": section,
+                "chunk_index": chunk_index,
+                "score": float(row["score"]),
+            }
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Embedding helper (always Ollama)
+# ---------------------------------------------------------------------------
+
+
+async def _embed_text(text: str) -> list[float]:
+    """Embed text using Ollama embedding model."""
+    resp = ollama.embeddings(model=embed_model, text=text)
+    return resp["embedding"]
+
+
+# ---------------------------------------------------------------------------
+# Generation backends
+# ---------------------------------------------------------------------------
+
+def _build_system_prompt() -> str:
+    return (
+        "You are EdinTech-RAG, an expert technical assistant for industrial "
+        "equipment documentation. Answer the user's question using ONLY the "
+        "provided context from company documents. If the context does not "
+        "contain sufficient information to answer fully, say so clearly and "
+        "list what information is missing. Always cite your sources by filename "
+        "and section heading. Be precise, technical, and concise."
+    )
+
+
+def _build_user_prompt(question: str, sources: list[dict[str, Any]]) -> str:
+    context_parts = []
+    for i, src in enumerate(sources):
+        context_parts.append(
+            f"[Source {i+1}] File: {src['filename']}, "
+            f"Section: {src['section']}, Score: {src['score']:.4f}\n"
+            f"{src['content']}"
+        )
+    context = "\n\n---\n\n".join(context_parts)
+
+    return (
+        f"Question: {question}\n\n"
+        f"Relevant document excerpts:\n\n{context}\n\n"
+        "Provide a clear, technical answer based on the excerpts above."
+    )
+
+
+async def _generate_with_ollama(
+    system_prompt: str,
+    user_prompt: str,
+    show_thinking: bool = False,
+) -> tuple[str, str | None]:
+    """Generate an answer using Ollama with optional extended thinking."""
+    think_mode = "true" if (show_thinking or ollama_think) else "false"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    response = ollama.chat(
+        model=gen_model,
+        messages=messages,
+        options={
+            "num_predict": 2048,
+            "temperature": 0.1,
+            "thinking": think_mode,
+        },
+    )
+
+    answer = response["message"]["content"]
+    thinking = None
+
+    # Extract thinking content if present (model wraps it in tags)
+    thinking_match = re.search(
+        r"<think>(.*?)</think>", answer, re.DOTALL
+    )
+    if thinking_match:
+        thinking = thinking_match.group(1).strip()
+        answer = re.sub(r"<think>.*?</think>\s*", "", answer, flags=re.DOTALL).strip()
+
+    return answer, thinking
+
+
+async def _generate_with_llama_cpp(
+    system_prompt: str,
+    user_prompt: str,
+    show_thinking: bool = False,
+) -> tuple[str, str | None]:
+    """Generate an answer using llama.cpp server (OpenAI-compatible API).
+
+    llama-server exposes an /v1/chat/completions endpoint compatible with
+    the OpenAI Python client. We use httpx directly to avoid adding another
+    dependency for the optional backend.
+    """
+    system_msg = {"role": "system", "content": system_prompt}
+    user_msg = {"role": "user", "content": user_prompt}
+
+    payload = {
+        "model": "",  # llama-server ignores model name on single-model instances
+        "messages": [system_msg, user_msg],
+        "temperature": 0.1,
+        "max_tokens": 4096,
+        "top_k": 20,
+        "top_p": 0.95,
+        "presence_penalty": 1.5,
+    }
+
+    # Extended thinking: prepend reasoning budget for Qwen3-style models
+    if show_thinking or ollama_think:
+        payload["reasoning_effort"] = "high"
+        # Some llama.cpp builds support the 'thinking' parameter via extra_body
+        payload["extra_body"] = {"thinking": {"budget_tokens": 2048}}
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            f"{llama_server_url.rstrip('/')}/v1/chat/completions",
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    answer = data["choices"][0]["message"]["content"]
+    thinking = None
+
+    # Extract thinking content if present (model wraps it in tags)
+    thinking_match = re.search(
+        r"<think>(.*?)</think>", answer, re.DOTALL
+    )
+    if thinking_match:
+        thinking = thinking_match.group(1).strip()
+        answer = re.sub(r"<think>.*?</think>\s*", "", answer, flags=re.DOTALL).strip()
+
+    return answer, thinking
+
+
+# Map backend name → coroutine
+_GENERATORS = {
+    "ollama": _generate_with_ollama,
+    "llama_cpp": _generate_with_llama_cpp,
+}
+
+
+# ---------------------------------------------------------------------------
+# API endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/health", response_model=HealthStatus)
+async def health():
+    """Health check — verifies PostgreSQL and generation backend."""
+    postgres_ok = False
+    total_documents = 0
+    total_chunks = 0
+
+    try:
+        pool = await _get_pool()
+        async with pool.acquire() as conn:
+            total_documents = await conn.fetchval(
+                "SELECT COUNT(*) FROM documents"
+            )
+            total_chunks = await conn.fetchval("SELECT COUNT(*) FROM chunks")
+        postgres_ok = True
+    except Exception:
+        pass
+
+    ollama_ok = False
+    embed_available = False
+    gen_ok = False
+
+    if gen_backend == "llama_cpp":
+        # Check llama.cpp server
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{llama_server_url}/health")
+                gen_ok = resp.status_code < 400
+        except Exception:
+            pass
+    else:
+        # Check Ollama + models
+        try:
+            models = ollama.list()
+            model_names = [m.get("name", "") for m in models.get("models", [])]
+            ollama_ok = True
+            embed_available = any(embed_model.split(":")[0] in n for n in model_names)
+            gen_ok = any(gen_model.split(":")[0] in n for n in model_names)
+        except Exception:
+            pass
+
+    status = "healthy" if (postgres_ok and gen_ok) else "degraded"
+    return HealthStatus(
+        postgres_ok=postgres_ok,
+        ollama_ok=ollama_ok,
+        embed_model_available=embed_available,
+        generation_backend=gen_backend,
+        generation_ok=gen_ok,
+        total_documents=total_documents,
+        total_chunks=total_chunks,
+        message=status,
+    )
+
+
+@app.post("/query", response_model=QueryResponse)
+async def query(request: QueryRequest):
+    """Ask a question against the document corpus.
+
+    Performs hybrid search (semantic + keyword via RRF), then generates an
+    answer using the configured generation backend with optional extended
+    thinking mode.
+    """
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    # Step 1: Embed the question
+    try:
+        embedding = await _embed_text(request.question)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Embedding failed: {exc}",
+        ) from exc
+
+    # Step 2: Hybrid search
+    try:
+        sources = await _hybrid_search(
+            query_text=request.question,
+            embedding=embedding,
+            top_k=request.top_k,
+            filters=request.filters,
+        )
+    except Exception as exc:
+        logger.error("Hybrid search failed: %s", exc)
+        raise HTTPException(
+            status_code=503, detail=f"Search failed: {exc}"
+        ) from exc
+
+    if not sources:
+        return QueryResponse(
+            answer="No relevant documents found for your question.",
+            sources=[],
+        )
+
+    # Step 3: Generate answer using selected backend
+    gen_fn = _GENERATORS.get(gen_backend)
+    if gen_fn is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unknown generation backend: {gen_backend}. "
+                   f"Supported: {list(_GENERATORS.keys())}",
+        )
+
+    try:
+        system_prompt = _build_system_prompt()
+        user_prompt = _build_user_prompt(request.question, sources)
+        answer, thinking = await gen_fn(
+            system_prompt, user_prompt, show_thinking=request.show_thinking
+        )
+    except Exception as exc:
+        logger.error("Generation failed (%s): %s", gen_backend, exc)
+        raise HTTPException(
+            status_code=503, detail=f"Generation failed: {exc}"
+        ) from exc
+
+    return QueryResponse(
+        answer=answer,
+        thinking=thinking if request.show_thinking else None,
+        sources=[Source(**s) for s in sources],
+    )
+
+
+@app.get("/documents", response_model=list[DocumentInfo])
+async def list_documents():
+    """List all ingested documents with metadata and chunk counts."""
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT d.id, d.filename, d.file_type, d.document_category,
+                   d.equipment_id, d.location, d.revision,
+                   d.document_date, d.ingested_at,
+                   COUNT(c.id) AS chunk_count
+            FROM documents d
+            LEFT JOIN chunks c ON c.document_id = d.id
+            GROUP BY d.id
+            ORDER BY d.ingested_at DESC
+            """
+        )
+
+    return [
+        DocumentInfo(
+            id=int(r["id"]),
+            filename=r["filename"],
+            file_type=str(r["file_type"]),
+            document_category=str(r["document_category"]),
+            equipment_id=int(r["equipment_id"]) if r["equipment_id"] else None,
+            location=r["location"],
+            revision=r["revision"],
+            document_date=str(r["document_date"]) if r["document_date"] else None,
+            ingested_at=str(r["ingested_at"]),
+            chunk_count=int(r["chunk_count"]),
+        )
+        for r in rows
+    ]
+
+
+@app.get("/documents/{doc_id}", response_model=DocumentInfo)
+async def get_document(doc_id: int):
+    """Get a single document by ID."""
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT d.id, d.filename, d.file_type, d.document_category,
+                   d.equipment_id, d.location, d.revision,
+                   d.document_date, d.ingested_at,
+                   COUNT(c.id) AS chunk_count
+            FROM documents d
+            LEFT JOIN chunks c ON c.document_id = d.id
+            WHERE d.id = $1
+            GROUP BY d.id
+            """,
+            doc_id,
+        )
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return DocumentInfo(
+        id=int(row["id"]),
+        filename=row["filename"],
+        file_type=str(row["file_type"]),
+        document_category=str(row["document_category"]),
+        equipment_id=int(row["equipment_id"]) if row["equipment_id"] else None,
+        location=row["location"],
+        revision=row["revision"],
+        document_date=str(row["document_date"]) if row["document_date"] else None,
+        ingested_at=str(row["ingested_at"]),
+        chunk_count=int(row["chunk_count"]),
+    )
+
+
+@app.delete("/documents/{doc_id}", status_code=204)
+async def delete_document(doc_id: int):
+    """Delete a document and all its chunks (cascade)."""
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM documents WHERE id = $1", doc_id
+        )
+    if result == "DELETE 0":
+        raise HTTPException(status_code=404, detail="Document not found")
+
+
+@app.get("/documents/{doc_id}/chunks")
+async def list_chunks(doc_id: int, page: int = 1, per_page: int = 20):
+    """List chunks for a specific document with pagination."""
+    pool = await _get_pool()
+    offset = (page - 1) * per_page
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, content, metadata
+            FROM chunks
+            WHERE document_id = $1
+            ORDER BY id
+            LIMIT $2 OFFSET $3
+            """,
+            doc_id,
+            per_page,
+            offset,
+        )
+
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM chunks WHERE document_id = $1", doc_id
+        )
+
+    return {
+        "document_id": doc_id,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "chunks": [
+            {
+                "id": int(r["id"]),
+                "content": r["content"],
+                "metadata": r["metadata"] or {},
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/ingest")
+async def ingest_document(
+    file: Any,
+    category: str = "other",
+    equipment_id: str | None = Form(default=None),
+    location: str | None = Form(default=None),
+    revision: str | None = Form(default=None),
+):
+    """Upload and ingest a document via multipart form data.
+
+    Accepts a file plus optional metadata fields. Saves the file temporarily,
+    converts it to markdown, inserts into the documents table, chunks + embeds
+    via chunker.py, then cleans up the temp file.
+    """
+    from converter import convert_file  # noqa: E402
+    from chunker import chunk_and_insert  # noqa: E402
+
+    # Save uploaded file to a temporary location
+    with tempfile.NamedTemporaryFile(
+        delete=False, suffix=Path(file.filename).suffix
+    ) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        path = Path(tmp_path)
+        file_type = path.suffix.lstrip(".").lower()
+
+        # Convert to markdown
+        try:
+            markdown, metadata = convert_file(str(path))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Conversion failed: {exc}"
+            ) from exc
+
+        # Insert document record and chunk/embed
+        import psycopg  # noqa: E402
+
+        db = psycopg.connect(env_db_url)
+        try:
+            cur = db.cursor()
+            eq_id = int(equipment_id) if equipment_id else None
+            cur.execute(
+                """
+                INSERT INTO documents (filename, file_type, document_category,
+                                       title, markdown_content, source_path, metadata,
+                                       equipment_id, location, revision)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    file.filename,
+                    file_type,
+                    category,
+                    metadata.get("title"),
+                    markdown,
+                    tmp_path,
+                    json.dumps(metadata, default=str),
+                    eq_id,
+                    location,
+                    revision,
+                ),
+            )
+            doc_id = cur.fetchone()[0]
+
+            chunks_count = chunk_and_insert(doc_id, markdown, file_type, db)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=500, detail=f"Ingestion failed: {exc}"
+            ) from exc
+        finally:
+            db.close()
+
+    finally:
+        # Clean up temp file
+        Path(tmp_path).unlink(missing_ok=True)
+
+    return {"document_id": doc_id, "filename": file.filename, "chunks": chunks_count}
+
+
+@app.post("/documents/upload")
+async def upload_document(file_path: str, category: str = "other"):
+    """Upload and ingest a document by local path.
+
+    Converts the file to markdown, chunks it, embeds each chunk, and inserts
+    into the database. Uses converter.py + chunker.py logic internally.
+    """
+    from pathlib import Path
+
+    path = Path(file_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+
+    # Import converters
+    try:
+        from converter import convert_file  # noqa: E402
+        from chunker import chunk_and_insert  # noqa: E402
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Missing converter modules: {exc}"
+        ) from exc
+
+    try:
+        markdown, metadata = convert_file(str(path))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Conversion failed: {exc}"
+        ) from exc
+
+    # Use psycopg for document insertion (chunker uses sync DB)
+    import psycopg  # noqa: E402
+
+    db = psycopg.connect(env_db_url)
+    try:
+        cur = db.cursor()
+        cur.execute(
+            """
+            INSERT INTO documents (filename, file_type, document_category,
+                                   title, markdown_content, source_path, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                path.name,
+                path.suffix.lstrip(".").lower(),
+                category,
+                metadata.get("title"),
+                markdown,
+                str(path),
+                json.dumps(metadata, default=str),
+            ),
+        )
+        doc_id = cur.fetchone()[0]
+
+        chunks_count = chunk_and_insert(doc_id, markdown, path.suffix.lstrip(".").lower(), db)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Ingestion failed: {exc}") from exc
+    finally:
+        db.close()
+
+    return {"document_id": doc_id, "chunks": chunks_count}
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def main():
+    """Run the server."""
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=os.environ.get("UVICORN_RELOAD", "false").lower() == "true",
+    )
+
+
+if __name__ == "__main__":
+    main()
