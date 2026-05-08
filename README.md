@@ -8,14 +8,14 @@ A fully local RAG (Retrieval-Augmented Generation) system that ingests PDFs, spr
 
 ```
 ┌──────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Documents   │───▶│  Converter       │───▶│  Chunker        │
+│  Documents   │────▶│  Converter       │────▶│  Chunker        │
 │  (PDF/XLSX/  │     │  → Structured    │     │  → Chunks +     │
 │   CSV)       │     │    Markdown      │     │    Embeddings   │
 └──────────────┘     └──────────────────┘     └────────┬────────┘
                                                        │
                                                        ▼
 ┌──────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  FastAPI     │◀───│  Hybrid Search   │◀───│  PostgreSQL     │
+│  FastAPI     │◀────│  Hybrid Search   │◀────│  PostgreSQL     │
 │  REST API    │     │  (RRF)           │     │  + pgvector     │
 │              │     └──────────────────┘     │  (chunks table) │
 └──────┬───────┘                              └─────────────────┘
