@@ -101,7 +101,7 @@ begin
             ))                                                                            as tm_rank
         from chunks c
         inner join documents d on d.id = c.document_id
-        where c.fts @@ plainto_tsquery('english', query_text)
+        where c.fts @@ plainto_tsquery('english', query_text) -- textual (sparse) search component denoted by @@
           and (filter_equipment_id      is null or d.equipment_id      = filter_equipment_id)
           and (filter_document_category is null or d.document_category = filter_document_category)
           and (filter_file_type         is null or d.file_type         = filter_file_type)
@@ -128,7 +128,7 @@ begin
           and (filter_document_category is null or d.document_category = filter_document_category)
           and (filter_file_type         is null or d.file_type         = filter_file_type)
           and (filter_location          is null or d.location          = filter_location)
-        order by c.embedding <=> query_embedding
+        order by c.embedding <=> query_embedding -- vector embedding (dense) search component denoted by <=>, cosine distance operator
         limit v_limit
     ),
     combined as (
