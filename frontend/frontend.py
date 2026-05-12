@@ -26,8 +26,14 @@ import streamlit as st
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000").rstrip("/")
 
 CATEGORIES = [
-    "manual", "datasheet", "maintenance_record", "procedure",
-    "report", "specification", "log", "other",
+    "manual",
+    "datasheet",
+    "maintenance_record",
+    "procedure",
+    "report",
+    "specification",
+    "log",
+    "other",
 ]
 
 FILE_TYPES = ["", "pdf", "xlsx", "csv", "md", "txt"]
@@ -50,13 +56,13 @@ st.set_page_config(
 
 def _init_session() -> None:
     defaults: dict[str, Any] = {
-        "messages":              [],
-        "ingestion_jobs":        {},
-        "filter_equipment_id":   "",
-        "filter_file_type":      "",
+        "messages": [],
+        "ingestion_jobs": {},
+        "filter_equipment_id": "",
+        "filter_file_type": "",
         "filter_document_category": "",
-        "filter_location":       "",
-        "filter_top_k":          5,
+        "filter_location": "",
+        "filter_top_k": 5,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -99,8 +105,9 @@ def _extract_error(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _start_ingestion(files: list, category: str, equipment_id: str,
-                     location: str, revision: str) -> None:
+def _start_ingestion(
+    files: list, category: str, equipment_id: str, location: str, revision: str
+) -> None:
     for f in files:
         data = f.read()
         try:
@@ -108,10 +115,10 @@ def _start_ingestion(files: list, category: str, equipment_id: str,
                 f"{BACKEND_URL}/ingest",
                 files={"file": (f.name, data, f.type)},
                 data={
-                    "category":     category,
+                    "category": category,
                     "equipment_id": equipment_id or None,
-                    "location":     location or None,
-                    "revision":     revision or None,
+                    "location": location or None,
+                    "revision": revision or None,
                 },
                 timeout=30,
             )
@@ -119,10 +126,10 @@ def _start_ingestion(files: list, category: str, equipment_id: str,
             job_id = result.json()["job_id"]
             st.session_state.ingestion_jobs[job_id] = {
                 "filename": f.name,
-                "status":   "queued",
-                "message":  f"Queued **{f.name}**",
+                "status": "queued",
+                "message": f"Queued **{f.name}**",
                 "progress": 0,
-                "result":   None,
+                "result": None,
             }
         except Exception as exc:
             st.sidebar.error(f"Failed to start ingestion for {f.name}: {exc}")
@@ -138,13 +145,13 @@ def _poll_jobs() -> bool:
         try:
             resp = httpx.get(f"{BACKEND_URL}/ingest/status/{job_id}", timeout=10)
             if resp.status_code == 404:
-                job["status"]  = "error"
+                job["status"] = "error"
                 job["message"] = "Job not found (server restarted?)"
                 continue
-            data             = resp.json()
-            job["status"]    = data.get("status",   job["status"])
-            job["message"]   = data.get("message",  job["message"])
-            job["progress"]  = data.get("progress", job["progress"])
+            data = resp.json()
+            job["status"] = data.get("status", job["status"])
+            job["message"] = data.get("message", job["message"])
+            job["progress"] = data.get("progress", job["progress"])
             if data.get("result"):
                 job["result"] = data["result"]
         except Exception as exc:
@@ -154,8 +161,8 @@ def _poll_jobs() -> bool:
 
 def _render_job_progress(job_id: str, job: dict) -> None:
     """Render a compact progress block for one ingestion job."""
-    status   = job["status"]
-    message  = job["message"]
+    status = job["status"]
+    message = job["message"]
     progress = job.get("progress", 0)
     filename = job["filename"]
 
@@ -230,8 +237,10 @@ with st.sidebar:
     col_a, col_b = st.columns(2)
     with col_a:
         upload_category = st.selectbox(
-            "Category", options=CATEGORIES,
-            index=CATEGORIES.index("other"), key="upload_category",
+            "Category",
+            options=CATEGORIES,
+            index=CATEGORIES.index("other"),
+            key="upload_category",
         )
     with col_b:
         upload_equipment_id = st.text_input("Equipment ID", key="upload_equipment_id")
@@ -242,8 +251,12 @@ with st.sidebar:
     with col_d:
         upload_revision = st.text_input("Revision", key="upload_revision")
 
-    if st.button("Ingest Files", type="primary", use_container_width=True,
-                 disabled=not uploaded_files):
+    if st.button(
+        "Ingest Files",
+        type="primary",
+        use_container_width=True,
+        disabled=not uploaded_files,
+    ):
         _start_ingestion(
             uploaded_files,
             st.session_state.upload_category,
@@ -263,12 +276,12 @@ with st.sidebar:
         st.markdown("### ⚙️ Processing")
 
         active_jobs = {
-            jid: j for jid, j in jobs.items()
+            jid: j
+            for jid, j in jobs.items()
             if j["status"] not in ("complete", "error")
         }
         done_jobs = {
-            jid: j for jid, j in jobs.items()
-            if j["status"] in ("complete", "error")
+            jid: j for jid, j in jobs.items() if j["status"] in ("complete", "error")
         }
 
         for job_id, job in jobs.items():
@@ -318,12 +331,15 @@ with st.expander("🔍 Query Filters", expanded=False):
             st.text_input("Equipment ID", key="filter_equipment_id")
         with c2:
             st.selectbox(
-                "File Type", options=FILE_TYPES, key="filter_file_type",
+                "File Type",
+                options=FILE_TYPES,
+                key="filter_file_type",
                 format_func=lambda x: x or "Any",
             )
         with c3:
             st.selectbox(
-                "Category", options=[""] + CATEGORIES,
+                "Category",
+                options=[""] + CATEGORIES,
                 key="filter_document_category",
                 format_func=lambda x: x or "Any",
             )
@@ -359,10 +375,10 @@ if prompt := st.chat_input("Ask a question about your documents…"):
 
     equip_raw = st.session_state.filter_equipment_id.strip()
     filters = {
-        "equipment_id":      equip_raw or None,
-        "file_type":         _nonempty(st.session_state.filter_file_type),
+        "equipment_id": equip_raw or None,
+        "file_type": _nonempty(st.session_state.filter_file_type),
         "document_category": _nonempty(st.session_state.filter_document_category),
-        "location":          _nonempty(st.session_state.filter_location),
+        "location": _nonempty(st.session_state.filter_location),
     }
     top_k = int(st.session_state.filter_top_k)
 
@@ -380,9 +396,9 @@ if prompt := st.chat_input("Ask a question about your documents…"):
             resp = httpx.post(
                 f"{BACKEND_URL}/query",
                 json={
-                    "question":      prompt,
-                    "filters":       filters,
-                    "top_k":         top_k,
+                    "question": prompt,
+                    "filters": filters,
+                    "top_k": top_k,
                     "show_thinking": True,
                 },
                 timeout=180,
@@ -390,9 +406,9 @@ if prompt := st.chat_input("Ask a question about your documents…"):
             resp.raise_for_status()
             result = resp.json()
 
-            answer  = result.get("answer", "")
+            answer = result.get("answer", "")
             thinking = result.get("thinking")
-            sources  = result.get("sources", [])
+            sources = result.get("sources", [])
 
             answer_slot.markdown(answer)
 
@@ -408,12 +424,14 @@ if prompt := st.chat_input("Ask a question about your documents…"):
                             f"({src['doc_category']}) | score: `{src['rrf_score']:.4f}`"
                         )
 
-            st.session_state.messages.append({
-                "role":    "assistant",
-                "content": answer,
-                "thinking": thinking,
-                "sources":  sources,
-            })
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "thinking": thinking,
+                    "sources": sources,
+                }
+            )
 
         except httpx.HTTPStatusError as exc:
             answer_slot.error(

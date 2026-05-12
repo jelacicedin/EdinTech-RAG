@@ -25,17 +25,17 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 VISION_MODEL = os.environ.get("VISION_MODEL", "").strip()
-OLLAMA_URL   = os.environ.get("OLLAMA_URL",   "http://localhost:11434")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
 # Skip images smaller than this (filters out icons / decorative elements)
-_MIN_IMG_WIDTH  = 100
+_MIN_IMG_WIDTH = 100
 _MIN_IMG_HEIGHT = 100
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-_DATE_RE     = re.compile(r"\b(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})\b")
+_DATE_RE = re.compile(r"\b(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})\b")
 _REVISION_RE = re.compile(r"\b(v?\d+\.\d+(?:\.\d+)?)\b")
 
 
@@ -43,8 +43,14 @@ def _find_first_dates(text: str) -> list[datetime.date]:
     dates: list[datetime.date] = []
     for m in _DATE_RE.finditer(text):
         raw = m.group(1)
-        for fmt in ("%m/%d/%Y", "%d-%m-%Y", "%m-%d-%Y", "%Y-%m-%d",
-                    "%m/%d/%y", "%d-%m-%y"):
+        for fmt in (
+            "%m/%d/%Y",
+            "%d-%m-%Y",
+            "%m-%d-%Y",
+            "%Y-%m-%d",
+            "%m/%d/%y",
+            "%d-%m-%y",
+        ):
             try:
                 dates.append(datetime.datetime.strptime(raw, fmt).date())
                 break
@@ -64,7 +70,7 @@ def _escape_md_cell(val: Any) -> str:
 
 def _dataframe_to_md(df: pd.DataFrame) -> str:
     headers = df.columns.astype(str).tolist()
-    lines   = [
+    lines = [
         "| " + " | ".join(headers) + " |",
         "| " + " | ".join("---" for _ in headers) + " |",
     ]
@@ -78,7 +84,7 @@ def _plumber_table_to_md(table: list[list]) -> str:
     if not table or not table[0]:
         return ""
     header = [_escape_md_cell(c) for c in table[0]]
-    lines  = [
+    lines = [
         "| " + " | ".join(header) + " |",
         "| " + " | ".join("---" for _ in header) + " |",
     ]
@@ -100,6 +106,7 @@ def _describe_image(img_bytes: bytes) -> str | None:
         return None
     try:
         import ollama
+
         resp = ollama.chat(
             model=VISION_MODEL,
             messages=[
@@ -138,10 +145,10 @@ def _convert_pdf(
 
     import pdfplumber
 
-    path  = Path(file_path)
+    path = Path(file_path)
     title = path.stem
 
-    doc        = fitz.open(file_path)
+    doc = fitz.open(file_path)
     page_count = len(doc)
     md_parts: list[str] = []
 
@@ -150,12 +157,10 @@ def _convert_pdf(
             if progress_callback:
                 progress_callback(f"Converting page {page_idx + 1}/{page_count} …")
 
-            fitz_page  = doc[page_idx]
+            fitz_page = doc[page_idx]
             plumb_page = pdf.pages[page_idx]
 
-            heading = (
-                f"## Page {page_idx + 1}" if page_count > 1 else f"# {title}"
-            )
+            heading = f"## Page {page_idx + 1}" if page_count > 1 else f"# {title}"
             section: list[str] = [heading]
 
             # Text via PyMuPDF — significantly faster than pdfplumber for plain text
@@ -170,13 +175,11 @@ def _convert_pdf(
                 for t_idx, table in valid:
                     md = _plumber_table_to_md(table)
                     if md:
-                        label = (
-                            f"### Table {t_idx}" if len(valid) > 1 else "### Table"
-                        )
+                        label = f"### Table {t_idx}" if len(valid) > 1 else "### Table"
                         section.append(f"{label}\n\n{md}")
 
             # Images via PyMuPDF
-            img_refs  = fitz_page.get_images(full=True)
+            img_refs = fitz_page.get_images(full=True)
             img_parts: list[str] = []
             for img_num, img_ref in enumerate(img_refs, start=1):
                 xref = img_ref[0]
@@ -209,14 +212,14 @@ def _convert_pdf(
 
     doc.close()
 
-    full_md     = "\n\n".join(md_parts)
+    full_md = "\n\n".join(md_parts)
     first_dates = _find_first_dates(full_md)
 
     return full_md, {
-        "title":             title,
-        "detected_date":     first_dates[0].isoformat() if first_dates else None,
+        "title": title,
+        "detected_date": first_dates[0].isoformat() if first_dates else None,
         "detected_revision": _find_first_revision(full_md),
-        "page_count":        page_count,
+        "page_count": page_count,
     }
 
 
@@ -239,16 +242,14 @@ def _convert_xlsx(
     except ImportError:
         raise ImportError("Install openpyxl: pip install openpyxl")
 
-    wb           = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
-    md_parts:    list[str] = []
+    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+    md_parts: list[str] = []
     sheet_names: list[str] = []
-    total        = len(wb.sheetnames)
+    total = len(wb.sheetnames)
 
     for sheet_idx, sheet_name in enumerate(wb.sheetnames, start=1):
         if progress_callback:
-            progress_callback(
-                f"Converting sheet {sheet_idx}/{total}: {sheet_name} …"
-            )
+            progress_callback(f"Converting sheet {sheet_idx}/{total}: {sheet_name} …")
 
         ws = wb[sheet_name]
         sheet_names.append(sheet_name)
@@ -291,14 +292,14 @@ def _convert_xlsx(
         md_parts.append("")
 
     wb.close()
-    text        = "\n".join(md_parts)
+    text = "\n".join(md_parts)
     first_dates = _find_first_dates(text)
 
     return text, {
-        "title":             Path(file_path).stem,
-        "detected_date":     first_dates[0].isoformat() if first_dates else None,
+        "title": Path(file_path).stem,
+        "detected_date": first_dates[0].isoformat() if first_dates else None,
         "detected_revision": _find_first_revision(text),
-        "sheet_names":       sheet_names,
+        "sheet_names": sheet_names,
     }
 
 
@@ -309,9 +310,9 @@ def _convert_xlsx(
 
 def _convert_csv(file_path: str) -> tuple[str, dict[str, Any]]:
     """Convert CSV to markdown table, splitting large files into chunks."""
-    df         = pd.read_csv(file_path)
+    df = pd.read_csv(file_path)
     chunk_size = 100
-    md_parts:  list[str] = []
+    md_parts: list[str] = []
 
     if len(df) <= chunk_size:
         md_parts.append(f"# {Path(file_path).stem}")
@@ -324,15 +325,15 @@ def _convert_csv(file_path: str) -> tuple[str, dict[str, Any]]:
             md_parts.append(_dataframe_to_md(df.iloc[start:end]))
             md_parts.append("")
 
-    text        = "\n\n".join(md_parts)
+    text = "\n\n".join(md_parts)
     first_dates = _find_first_dates(text)
 
     return text, {
-        "title":             Path(file_path).stem,
-        "detected_date":     first_dates[0].isoformat() if first_dates else None,
+        "title": Path(file_path).stem,
+        "detected_date": first_dates[0].isoformat() if first_dates else None,
         "detected_revision": _find_first_revision(text),
-        "row_count":         len(df),
-        "column_count":      len(df.columns),
+        "row_count": len(df),
+        "column_count": len(df.columns),
     }
 
 
@@ -359,7 +360,7 @@ def convert_file(
         *title*, *detected_date*, *detected_revision*.
     """
     path = Path(file_path)
-    ext  = path.suffix.lower()
+    ext = path.suffix.lower()
 
     if ext == ".pdf":
         return _convert_pdf(file_path, progress_callback=progress_callback)
@@ -370,10 +371,10 @@ def convert_file(
     elif ext in (".md", ".txt"):
         content = path.read_text(encoding="utf-8", errors="replace")
         return content, {
-            "title":             path.stem,
-            "detected_date":     None,
+            "title": path.stem,
+            "detected_date": None,
             "detected_revision": None,
-            "file_type":         ext.lstrip("."),
+            "file_type": ext.lstrip("."),
         }
     else:
         raise ValueError(f"Unsupported file type: {ext}")

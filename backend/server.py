@@ -81,6 +81,7 @@ def _sanitize_query_text(text: str) -> str:
     """Strip characters that break tsquery parsing (punctuation, special chars)."""
     return re.sub(r"[^\w\s]", " ", text).strip()
 
+
 _pool: asyncpg.Pool | None = None
 
 
@@ -189,8 +190,11 @@ async def _verify_startup() -> None:
         resp_data = ollama.list()
         models = resp_data.get("models", []) or []
         model_names = [m.get("name", "") or m.get("model", "") for m in models]
-        logger.info("Ollama reachable — %d model(s) available: %s",
-                    len(model_names), model_names)
+        logger.info(
+            "Ollama reachable — %d model(s) available: %s",
+            len(model_names),
+            model_names,
+        )
     except Exception as exc:
         logger.error("Ollama not reachable at %s — %s", ollama_url, exc)
 
@@ -201,7 +205,8 @@ async def _verify_startup() -> None:
                 resp = await client.get(f"{llama_server_url}/health")
                 logger.info(
                     "llama.cpp server reachable at %s (status=%d)",
-                    llama_server_url, resp.status_code,
+                    llama_server_url,
+                    resp.status_code,
                 )
         except Exception as exc:
             logger.error(
@@ -271,10 +276,12 @@ async def _hybrid_search(
     results = []
     for row in rows:
         meta = row["chunk_metadata"] or {}
-        section = meta.get("section_heading", "Unknown") if isinstance(meta, dict) else "Unknown"
-        chunk_index = (
-            meta.get("chunk_index", 0) if isinstance(meta, dict) else 0
+        section = (
+            meta.get("section_heading", "Unknown")
+            if isinstance(meta, dict)
+            else "Unknown"
         )
+        chunk_index = meta.get("chunk_index", 0) if isinstance(meta, dict) else 0
         results.append(
             {
                 "chunk_id": int(row["chunk_id"]),
@@ -305,6 +312,7 @@ async def _embed_text(text: str) -> list[float]:
 # ---------------------------------------------------------------------------
 # Generation backends
 # ---------------------------------------------------------------------------
+
 
 def _build_system_prompt() -> str:
     return (
@@ -388,7 +396,9 @@ async def _generate_with_ollama(
         m = re.search(r"<think>(.*?)</think>", answer, re.DOTALL)
         if m:
             thinking = m.group(1).strip()
-            answer = re.sub(r"<think>.*?</think>\s*", "", answer, flags=re.DOTALL).strip()
+            answer = re.sub(
+                r"<think>.*?</think>\s*", "", answer, flags=re.DOTALL
+            ).strip()
 
     return answer.strip(), thinking
 
@@ -435,9 +445,7 @@ async def _generate_with_llama_cpp(
     thinking = None
 
     # Extract thinking content if present (model wraps it in tags)
-    thinking_match = re.search(
-        r"<think>(.*?)</think>", answer, re.DOTALL
-    )
+    thinking_match = re.search(r"<think>(.*?)</think>", answer, re.DOTALL)
     if thinking_match:
         thinking = thinking_match.group(1).strip()
         answer = re.sub(r"<think>.*?</think>\s*", "", answer, flags=re.DOTALL).strip()
@@ -467,9 +475,7 @@ async def health():
     try:
         pool = await _get_pool()
         async with pool.acquire() as conn:
-            total_documents = await conn.fetchval(
-                "SELECT COUNT(*) FROM documents"
-            )
+            total_documents = await conn.fetchval("SELECT COUNT(*) FROM documents")
             total_chunks = await conn.fetchval("SELECT COUNT(*) FROM chunks")
         postgres_ok = True
     except Exception:
@@ -491,8 +497,12 @@ async def health():
         # Match by model name prefix (e.g. "qwen3-embedding:0.6b" matches "qwen3-embedding")
         embed_prefix = embed_model.split(":")[0]
         gen_prefix = gen_model.split(":")[0]
-        embed_available = any(n.startswith(embed_prefix + ":") or n == embed_prefix for n in model_names)
-        gen_ok = any(n.startswith(gen_prefix + ":") or n == gen_prefix for n in model_names)
+        embed_available = any(
+            n.startswith(embed_prefix + ":") or n == embed_prefix for n in model_names
+        )
+        gen_ok = any(
+            n.startswith(gen_prefix + ":") or n == gen_prefix for n in model_names
+        )
     except Exception:
         pass
 
@@ -548,9 +558,7 @@ async def query(request: QueryRequest):
         )
     except Exception as exc:
         logger.error("Hybrid search failed: %s", exc)
-        raise HTTPException(
-            status_code=503, detail=f"Search failed: {exc}"
-        ) from exc
+        raise HTTPException(status_code=503, detail=f"Search failed: {exc}") from exc
 
     if not sources:
         return QueryResponse(
@@ -564,7 +572,7 @@ async def query(request: QueryRequest):
         raise HTTPException(
             status_code=500,
             detail=f"Unknown generation backend: {gen_backend}. "
-                   f"Supported: {list(_GENERATORS.keys())}",
+            f"Supported: {list(_GENERATORS.keys())}",
         )
 
     try:
@@ -662,9 +670,7 @@ async def delete_document(doc_id: int):
     """Delete a document and all its chunks (cascade)."""
     pool = await _get_pool()
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM documents WHERE id = $1", doc_id
-        )
+        result = await conn.execute("DELETE FROM documents WHERE id = $1", doc_id)
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail="Document not found")
 
@@ -768,15 +774,21 @@ async def ingest_document(
                 _ingest_progress[job_id]["message"] = msg
 
             try:
-                markdown, metadata = convert_file(str(path), progress_callback=_conv_progress)
+                markdown, metadata = convert_file(
+                    str(path), progress_callback=_conv_progress
+                )
             except Exception as exc:
-                logger.error("[ingest] Conversion failed for %s: %s", file.filename, exc)
+                logger.error(
+                    "[ingest] Conversion failed for %s: %s", file.filename, exc
+                )
                 _ingest_progress[job_id]["status"] = "error"
                 _ingest_progress[job_id]["message"] = f"Conversion failed: {exc}"
                 return
 
             _ingest_progress[job_id]["stage"] = "inserting"
-            _ingest_progress[job_id]["message"] = f"Inserting **{file.filename}** into database …"
+            _ingest_progress[job_id][
+                "message"
+            ] = f"Inserting **{file.filename}** into database …"
             logger.info("[ingest] Inserting %s into database", file.filename)
 
             import psycopg  # noqa: E402
@@ -809,14 +821,19 @@ async def ingest_document(
                 doc_id = cur.fetchone()[0]
 
                 _ingest_progress[job_id]["stage"] = "chunking"
-                _ingest_progress[job_id]["message"] = f"Chunking and embedding **{file.filename}** …"
+                _ingest_progress[job_id][
+                    "message"
+                ] = f"Chunking and embedding **{file.filename}** …"
                 logger.info("[ingest] Chunking & embedding %s", file.filename)
 
                 def _progress(msg: str) -> None:
                     _ingest_progress[job_id]["message"] = msg
 
                 chunks_count = chunk_and_insert(
-                    doc_id, markdown, file_type, db,
+                    doc_id,
+                    markdown,
+                    file_type,
+                    db,
                     progress_callback=_progress,
                 )
                 db.commit()
@@ -834,7 +851,9 @@ async def ingest_document(
                 Path(tmp_path).unlink(missing_ok=True)
 
         _ingest_progress[job_id]["status"] = "complete"
-        _ingest_progress[job_id]["message"] = f"Done — **{file.filename}** ingested ({chunks_count} chunks)"
+        _ingest_progress[job_id][
+            "message"
+        ] = f"Done — **{file.filename}** ingested ({chunks_count} chunks)"
         _ingest_progress[job_id]["result"] = {
             "document_id": doc_id,
             "filename": file.filename,
@@ -851,10 +870,10 @@ def get_ingest_status(job_id: str):
     if job_id not in _ingest_progress:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    data    = dict(_ingest_progress[job_id])
-    stage   = data.get("stage")
+    data = dict(_ingest_progress[job_id])
+    stage = data.get("stage")
     message = data.get("message", "")
-    status  = data.get("status", "queued")
+    status = data.get("status", "queued")
 
     if status == "complete":
         progress = 100
@@ -874,14 +893,16 @@ def get_ingest_status(job_id: str):
         m = re.search(r"(\d+)[–\-](\d+)/(\d+)", message)
         if m:
             batch_end = int(m.group(2))
-            total_ch  = int(m.group(3))
-            progress  = int(50 + (batch_end / total_ch) * 45)
+            total_ch = int(m.group(3))
+            progress = int(50 + (batch_end / total_ch) * 45)
         else:
             progress = 50
     else:
         progress = 2
 
-    data["progress"] = min(progress, 99) if status not in ("complete", "error") else progress
+    data["progress"] = (
+        min(progress, 99) if status not in ("complete", "error") else progress
+    )
     return data
 
 
@@ -896,7 +917,7 @@ async def upload_document(file_path: str, category: str = "other"):
 
     path = Path(file_path)
     if not path.exists():
-        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")  # noqa: E501
 
     # Run blocking work off the event loop thread
     def _do_upload() -> dict:
@@ -917,7 +938,8 @@ async def upload_document(file_path: str, category: str = "other"):
             cur.execute(
                 """
                 INSERT INTO documents (filename, file_type, document_category,
-                                       title, markdown_content, source_path, metadata)
+                                       title, markdown_content,
+                                       source_path, metadata)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
@@ -939,7 +961,9 @@ async def upload_document(file_path: str, category: str = "other"):
             db.commit()
         except Exception as exc:
             db.rollback()
-            raise HTTPException(status_code=500, detail=f"Ingestion failed: {exc}") from exc
+            raise HTTPException(
+                status_code=500, detail=f"Ingestion failed: {exc}"
+            ) from exc
         finally:
             db.close()
 
@@ -947,7 +971,8 @@ async def upload_document(file_path: str, category: str = "other"):
 
     try:
         result = await asyncio.get_running_loop().run_in_executor(
-            None, _do_upload,
+            None,
+            _do_upload,
         )
     except HTTPException as he:
         raise he

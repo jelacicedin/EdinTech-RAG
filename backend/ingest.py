@@ -50,6 +50,7 @@ def ingest_file(file_path: str, category: str = "other") -> dict:
 
     # Connect to DB and insert document record
     import psycopg
+
     db = psycopg.connect(_get_db_url())
     try:
         cur = db.cursor()
@@ -78,7 +79,9 @@ def ingest_file(file_path: str, category: str = "other") -> dict:
 
         logger.info(
             "Ingested %s → document_id=%d, chunks=%d",
-            file_path, doc_id, chunks_count,
+            file_path,
+            doc_id,
+            chunks_count,
         )
         return {
             "status": "ok",
@@ -123,12 +126,14 @@ def ingest_directory(directory: str, category: str = "other") -> list[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="EdinTech-RAG ingestion worker")
     parser.add_argument(
-        "--dir", "-d",
+        "--dir",
+        "-d",
         default="/workspace/ingest",
         help="Directory to watch for documents (default: /workspace/ingest)",
     )
     parser.add_argument(
-        "--category", "-c",
+        "--category",
+        "-c",
         default="other",
         help="Document category (default: other)",
     )
